@@ -1,6 +1,23 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// Typed API error so callers (specifically `main`) can distinguish a fatal
+/// auth failure from a transient one without parsing error message strings.
+#[derive(Debug)]
+pub enum ApiError {
+    Unauthorized,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Unauthorized => write!(f, "Authentication failed (401)"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 pub struct ApiClient {
     client: reqwest::Client,
     base_url: String,
@@ -110,7 +127,7 @@ impl ApiClient {
             .context("Failed to reach API")?;
 
         if resp.status() == 401 {
-            bail!("Authentication failed. Token may be expired. Run `floppa-cli login` again.");
+            return Err(anyhow::Error::from(ApiError::Unauthorized));
         }
         if !resp.status().is_success() {
             bail!("GET /me failed: {}", resp.status());
@@ -128,7 +145,7 @@ impl ApiClient {
             .await?;
 
         if resp.status() == 401 {
-            bail!("Authentication failed. Run `floppa-cli login` again.");
+            return Err(anyhow::Error::from(ApiError::Unauthorized));
         }
         if !resp.status().is_success() {
             bail!("GET /me/peers failed: {}", resp.status());
@@ -158,6 +175,9 @@ impl ApiClient {
             .send()
             .await?;
 
+        if resp.status() == 401 {
+            return Err(anyhow::Error::from(ApiError::Unauthorized));
+        }
         if resp.status() == 402 {
             bail!("No active subscription. Cannot create peer.");
         }
@@ -181,6 +201,9 @@ impl ApiClient {
             .send()
             .await?;
 
+        if resp.status() == 401 {
+            return Err(anyhow::Error::from(ApiError::Unauthorized));
+        }
         if !resp.status().is_success() {
             bail!("GET /me/peers/{}/config failed: {}", peer_id, resp.status());
         }
@@ -223,7 +246,7 @@ impl ApiClient {
             .await?;
 
         if resp.status() == 401 {
-            bail!("Authentication failed. Run `floppa-cli login` again.");
+            return Err(anyhow::Error::from(ApiError::Unauthorized));
         }
         if resp.status() == 404 {
             bail!("VLESS not available on this server.");

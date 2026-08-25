@@ -5,6 +5,42 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for the CLI crate.
 
+## [Unreleased]
+
+Fixes a restart loop caused by treating an expired/rejected token as a
+transient failure, adds token-expiry visibility, and lets `service install`
+render an API-mode unit (no `--config`).
+
+### Fixed
+- An HTTP 401 from the API (expired or rejected token) is now a typed
+  `ApiError::Unauthorized` (`api.rs`) instead of an untyped `anyhow` error,
+  and `main` maps it to a dedicated exit code **77** (`EX_NOPERM`) instead of
+  the generic `1`.
+- The rendered systemd unit now sets `RestartPreventExitStatus=77`, so
+  systemd stops after the *first* fatal auth failure instead of
+  restart-looping until `start-limit-hit`. `SuccessExitStatus=0 130 143` is
+  also folded into the template, so a clean SIGINT/SIGTERM shutdown is not
+  counted as a failure.
+- `service install` / `service print` can now render an **API-mode** unit:
+  `--config` is optional (`Option<String>`), and omitting it produces a unit
+  whose `ExecStart` has no `--config` at all, matching how `connect` already
+  behaves without one. `--config <file>` behaviour is unchanged when given.
+- Added `--log-file` and `--token-file` passthrough to `service install` /
+  `service print`, so the generated unit can carry debug logging and a
+  `FLOPPA_TOKEN_FILE` override.
+
+### Added
+- `auth::token_expiry()` decodes (without verifying) the `exp` claim of a
+  saved JWT. This is advisory only: `login` prints "Token valid until ..."
+  after a successful login, and `connect`'s API path prints a warning if the
+  token looks expired or expires within 24h. It never affects the exit code
+  — the server's 401 remains the sole authority for exit 77, so a skewed
+  system clock cannot stop the service on a token the server would accept.
+- A global `--token-file` flag (env `FLOPPA_TOKEN_FILE`) overrides the
+  default `$XDG_CONFIG_HOME/floppa-cli/token` path, so a unit running as
+  `User=root` can read a token saved by a normal user without a second
+  `sudo floppa-cli login`.
+
 ## [0.5.0] - 2026-07-19
 
 CLI-only fork cleanup and repo hygiene.

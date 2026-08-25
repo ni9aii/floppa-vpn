@@ -11,12 +11,29 @@ use clap::{Parser, Subcommand};
 
 const DEFAULT_API_URL: &str = "https://floppa.okhsunrog.dev/api";
 
+/// `EX_NOPERM` (sysexits.h): the token was rejected or has expired. Distinct
+/// from a generic exit 1 so systemd can tell "re-auth needed" apart from a
+/// transient failure via `RestartPreventExitStatus=77` (see service.rs).
+const EXIT_AUTH: i32 = 77;
+
 #[derive(Parser)]
 #[command(name = "floppa-cli", about = "CLI client for Floppa VPN")]
 struct Cli {
     /// Write debug logs to a file (e.g. /tmp/floppa-cli.log)
     #[arg(long, global = true)]
     log_file: Option<String>,
+
+    /// Override the saved-token path (also settable via FLOPPA_TOKEN_FILE).
+    /// Needed when running as root (e.g. under systemd), since root's config
+    /// directory is not the user's. Being `global = true`, this also applies
+    /// to `service install`/`print`, where it sets the `--token-file` value
+    /// baked into the generated unit's `Environment=FLOPPA_TOKEN_FILE=...`
+    /// line — it must NOT be redeclared as a local field on `ServiceAction`,
+    /// or clap treats the two same-named args as one shared arg id and the
+    /// env var silently applies even when `--token-file` isn't passed on the
+    /// `service` subcommand line.
+    #[arg(long, global = true, env = "FLOPPA_TOKEN_FILE")]
+    token_file: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -75,9 +92,10 @@ enum Command {
 enum ServiceAction {
     /// Write /etc/systemd/system/floppa-cli.service and enable it (needs root)
     Install {
-        /// Config file (.conf) or VLESS URI file (resolved to an absolute path)
+        /// Config file (.conf) or VLESS URI file (resolved to an absolute path).
+        /// Omit for API mode (the unit calls the Floppa API to fetch a peer/config).
         #[arg(long)]
-        config: String,
+        config: Option<String>,
         /// Protocol: wireguard (default), amneziawg, or vless
         #[arg(long, default_value = "wireguard")]
         protocol: String,
@@ -87,6 +105,9 @@ enum ServiceAction {
         /// Skip DNS configuration
         #[arg(long)]
         no_dns: bool,
+        /// Write debug logs to this file (passed through to the unit's ExecStart)
+        #[arg(long)]
+        log_file: Option<String>,
         /// Enable only, do not start immediately
         #[arg(long)]
         no_start: bool,
@@ -95,14 +116,17 @@ enum ServiceAction {
     Uninstall,
     /// Print the unit file to stdout without touching the system
     Print {
+        /// Config file (.conf) or VLESS URI file. Omit for API mode.
         #[arg(long)]
-        config: String,
+        config: Option<String>,
         #[arg(long, default_value = "wireguard")]
         protocol: String,
         #[arg(long, default_value = tunnel::DEFAULT_INTERFACE_NAME)]
         interface: String,
         #[arg(long)]
         no_dns: bool,
+        #[arg(long)]
+        log_file: Option<String>,
     },
 }
 
@@ -110,22 +134,49 @@ fn is_vless(config_str: &str) -> bool {
     config_str.trim().starts_with("vless://")
 }
 
+/// Warn (never fail) if the local, unverified read of the token's `exp` claim
+/// says it's already past or close to expiry. This is advisory only: the
+/// server's 401 is the sole authority for whether the token is actually
+/// rejected (see `run`'s exit-code classification). A skewed system clock
+/// must not be able to turn this into a hard error.
+fn warn_if_expiring(token: &str) {
+    let Some(expiry) = auth::token_expiry(token) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    match expiry.duration_since(now) {
+        Err(_) => eprintln!("Warning: token appears expired — re-login if this fails."),
+        Ok(remaining) if remaining <= std::time::Duration::from_secs(24 * 3600) => {
+            let hours = remaining.as_secs() / 3600;
+            eprintln!("Warning: token expires in {hours}h");
+        }
+        Ok(_) => {}
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    // _guard must live until main() returns to flush the file appender
+    // _guard must live until it is explicitly dropped (below) to flush the
+    // file appender. It must NOT still be alive when `std::process::exit` is
+    // called: `exit` skips destructors entirely, so a guard dropped only by
+    // scope-exit-after-exit would never flush and `--log-file` would lose its
+    // tail. So: compute the exit code first, `drop(_guard)` explicitly, THEN
+    // call `exit`.
     let _guard = if let Some(ref log_path) = cli.log_file {
         let path = std::path::Path::new(log_path);
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
-        let filename = path
-            .file_name()
-            .context("Invalid log file path")?
-            .to_str()
-            .context("Invalid log file name")?;
+        let filename = match path.file_name().and_then(|f| f.to_str()) {
+            Some(f) => f.to_string(),
+            None => {
+                eprintln!("Error: invalid log file path: {log_path}");
+                std::process::exit(1);
+            }
+        };
         let file_appender = tracing_appender::rolling::never(dir, filename);
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         tracing_subscriber::fmt()
@@ -142,9 +193,32 @@ async fn main() -> Result<()> {
     };
     tracing_log::LogTracer::init().ok();
 
+    let result = run(cli).await;
+
+    let code: i32 = match result {
+        Ok(()) => 0,
+        Err(err) => {
+            if err.downcast_ref::<api::ApiError>().is_some() {
+                eprintln!("Token expired or rejected. Run `floppa-cli login` again.");
+                EXIT_AUTH
+            } else {
+                eprintln!("Error: {err:#}");
+                1
+            }
+        }
+    };
+
+    // Explicit drop BEFORE exit — see the trap noted above.
+    drop(_guard);
+    std::process::exit(code);
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    let token_file = cli.token_file.as_deref();
+
     match cli.command {
         Command::Login { api_url } => {
-            auth::login(&api_url).await?;
+            auth::login(&api_url, token_file).await?;
         }
         Command::Connect {
             config,
@@ -157,8 +231,9 @@ async fn main() -> Result<()> {
                 Some(path) => std::fs::read_to_string(&path)
                     .with_context(|| format!("Failed to read config file: {path}"))?,
                 None => {
-                    let token = auth::load_token()?
+                    let token = auth::load_token(token_file)?
                         .context("Not logged in. Run `floppa-cli login` first.")?;
+                    warn_if_expiring(&token);
                     let client = api::ApiClient::new(&api_url, &token);
                     let me = client.get_me().await?;
                     if let Some(ref sub) = me.subscription {
@@ -187,8 +262,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Peers { api_url } => {
-            let token =
-                auth::load_token()?.context("Not logged in. Run `floppa-cli login` first.")?;
+            let token = auth::load_token(token_file)?
+                .context("Not logged in. Run `floppa-cli login` first.")?;
             let client = api::ApiClient::new(&api_url, &token);
             let peers = client.list_peers().await?;
             if peers.is_empty() {
@@ -211,8 +286,8 @@ async fn main() -> Result<()> {
             peer_id,
             api_url,
         } => {
-            let token =
-                auth::load_token()?.context("Not logged in. Run `floppa-cli login` first.")?;
+            let token = auth::load_token(token_file)?
+                .context("Not logged in. Run `floppa-cli login` first.")?;
             let client = api::ApiClient::new(&api_url, &token);
             let config = if protocol == "vless" {
                 client.get_vless_config().await?
@@ -225,7 +300,7 @@ async fn main() -> Result<()> {
             print!("{config}");
         }
         Command::Logout => {
-            auth::logout()?;
+            auth::logout(token_file)?;
             eprintln!("Logged out.");
         }
         Command::Service { action } => match action {
@@ -234,9 +309,18 @@ async fn main() -> Result<()> {
                 protocol,
                 interface,
                 no_dns,
+                log_file,
                 no_start,
             } => {
-                service::install(&config, &protocol, &interface, no_dns, !no_start)?;
+                service::install(
+                    config.as_deref(),
+                    &protocol,
+                    &interface,
+                    no_dns,
+                    log_file.as_deref(),
+                    token_file,
+                    !no_start,
+                )?;
             }
             ServiceAction::Uninstall => {
                 service::uninstall()?;
@@ -246,8 +330,16 @@ async fn main() -> Result<()> {
                 protocol,
                 interface,
                 no_dns,
+                log_file,
             } => {
-                service::print_unit(&config, &protocol, &interface, no_dns)?;
+                service::print_unit(
+                    config.as_deref(),
+                    &protocol,
+                    &interface,
+                    no_dns,
+                    log_file.as_deref(),
+                    token_file,
+                )?;
             }
         },
     }
