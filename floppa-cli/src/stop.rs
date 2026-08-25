@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::tunnel;
+use crate::net;
 
 #[cfg(unix)]
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ pub fn stop(interface: &str, pid: Option<u32>, force: bool) -> Result<()> {
 
 #[cfg(unix)]
 fn stop_unix(interface: &str, pid: Option<u32>, force: bool) -> Result<()> {
-    if !tunnel::interface_exists(interface) {
+    if !net::interface_exists(interface) {
         println!("Floppa {interface}: not connected");
         return Ok(());
     }
@@ -103,7 +103,7 @@ fn stop_unix(interface: &str, pid: Option<u32>, force: bool) -> Result<()> {
 fn wait_until_disconnected(interface: &str, pid: u32, timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
-        if !tunnel::interface_exists(interface) {
+        if !net::interface_exists(interface) {
             return true;
         }
         if start.elapsed() >= timeout || !process_exists(pid) {

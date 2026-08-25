@@ -1,19 +1,25 @@
 mod api;
 mod auth;
 mod dns;
+mod net;
 mod reconnect;
+mod rollback;
 mod service;
+mod stop;
 mod tunnel;
 mod vless;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use floppa_tunnel_config::TunnelConfig;
+
+use api::ApiClientError;
 
 const DEFAULT_API_URL: &str = "https://floppa.okhsunrog.dev/api";
 
-/// `EX_NOPERM` (sysexits.h): the token was rejected or has expired. Distinct
-/// from a generic exit 1 so systemd can tell "re-auth needed" apart from a
-/// transient failure via `RestartPreventExitStatus=77` (see service.rs).
+/// `EX_NOPERM` (sysexits.h): the token was rejected or has expired. Distinct from a generic
+/// exit 1 so systemd can tell "re-auth needed" apart from a transient failure via
+/// `RestartPreventExitStatus=77` (see service.rs).
 const EXIT_AUTH: i32 = 77;
 
 #[derive(Parser)]
@@ -23,17 +29,19 @@ struct Cli {
     #[arg(long, global = true)]
     log_file: Option<String>,
 
-    /// Override the saved-token path (also settable via FLOPPA_TOKEN_FILE).
-    /// Needed when running as root (e.g. under systemd), since root's config
-    /// directory is not the user's. Being `global = true`, this also applies
-    /// to `service install`/`print`, where it sets the `--token-file` value
-    /// baked into the generated unit's `Environment=FLOPPA_TOKEN_FILE=...`
-    /// line — it must NOT be redeclared as a local field on `ServiceAction`,
-    /// or clap treats the two same-named args as one shared arg id and the
-    /// env var silently applies even when `--token-file` isn't passed on the
-    /// `service` subcommand line.
+    /// Login token file (default: <config dir>/floppa-cli/token; under sudo, the invoking
+    /// user's config dir). Being `global = true`, this also applies to `service
+    /// install`/`print`, where it sets the `--token-file` value baked into the generated unit's
+    /// `Environment=FLOPPA_TOKEN_FILE=...` line — it must NOT be redeclared as a local field on
+    /// `ServiceAction`, or clap treats the two same-named args as one shared arg id and the env
+    /// var silently applies even when `--token-file` isn't passed on the `service` subcommand
+    /// line.
     #[arg(long, global = true, env = "FLOPPA_TOKEN_FILE")]
-    token_file: Option<String>,
+    token_file: Option<std::path::PathBuf>,
+
+    /// Login token, bypassing the token file (prefer the env var over the flag)
+    #[arg(long, global = true, env = "FLOPPA_TOKEN", hide_env_values = true)]
+    token: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -51,9 +59,9 @@ enum Command {
         /// Config file (.conf) or VLESS URI file
         #[arg(long)]
         config: Option<String>,
-        /// Protocol: wireguard (default), amneziawg, or vless
-        #[arg(long, default_value = "wireguard")]
-        protocol: String,
+        /// Tunnel protocol (AmneziaWG by default, like the app)
+        #[arg(long, value_enum, default_value_t = api::Protocol::AmneziaWg)]
+        protocol: api::Protocol,
         /// TUN interface name
         #[arg(long, default_value = tunnel::DEFAULT_INTERFACE_NAME)]
         interface: String,
@@ -70,21 +78,36 @@ enum Command {
     },
     /// Fetch and print config (WireGuard/AmneziaWG .conf or VLESS URI)
     Config {
-        /// Protocol: wireguard (default), amneziawg, or vless
-        #[arg(long, default_value = "wireguard")]
-        protocol: String,
+        /// Tunnel protocol (AmneziaWG by default, like the app)
+        #[arg(long, value_enum, default_value_t = api::Protocol::AmneziaWg)]
+        protocol: api::Protocol,
         /// Peer ID (WireGuard/AmneziaWG only; uses first active peer of that protocol if omitted)
         #[arg(long)]
         peer_id: Option<i64>,
         #[arg(long, env = "FLOPPA_API_URL", default_value = DEFAULT_API_URL)]
         api_url: String,
     },
-    /// Remove saved login token
-    Logout,
+    /// Sign out: end this login's session on the server and remove the saved token
+    Logout {
+        #[arg(long, env = "FLOPPA_API_URL", default_value = DEFAULT_API_URL)]
+        api_url: String,
+    },
     /// Manage the systemd unit (install/uninstall the connector as a service)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+    /// Disconnect a running `floppa-cli connect` from another shell
+    Stop {
+        /// TUN interface name
+        #[arg(long, default_value = tunnel::DEFAULT_INTERFACE_NAME)]
+        interface: String,
+        /// Target a specific connect process (needed if more than one is running)
+        #[arg(long)]
+        pid: Option<u32>,
+        /// SIGKILL if a plain SIGTERM doesn't bring the interface down in time
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -96,9 +119,9 @@ enum ServiceAction {
         /// Omit for API mode (the unit calls the Floppa API to fetch a peer/config).
         #[arg(long)]
         config: Option<String>,
-        /// Protocol: wireguard (default), amneziawg, or vless
-        #[arg(long, default_value = "wireguard")]
-        protocol: String,
+        /// Tunnel protocol (AmneziaWG by default, like the app)
+        #[arg(long, value_enum, default_value_t = api::Protocol::AmneziaWg)]
+        protocol: api::Protocol,
         /// TUN interface name
         #[arg(long, default_value = tunnel::DEFAULT_INTERFACE_NAME)]
         interface: String,
@@ -119,8 +142,8 @@ enum ServiceAction {
         /// Config file (.conf) or VLESS URI file. Omit for API mode.
         #[arg(long)]
         config: Option<String>,
-        #[arg(long, default_value = "wireguard")]
-        protocol: String,
+        #[arg(long, value_enum, default_value_t = api::Protocol::AmneziaWg)]
+        protocol: api::Protocol,
         #[arg(long, default_value = tunnel::DEFAULT_INTERFACE_NAME)]
         interface: String,
         #[arg(long)]
@@ -134,11 +157,10 @@ fn is_vless(config_str: &str) -> bool {
     config_str.trim().starts_with("vless://")
 }
 
-/// Warn (never fail) if the local, unverified read of the token's `exp` claim
-/// says it's already past or close to expiry. This is advisory only: the
-/// server's 401 is the sole authority for whether the token is actually
-/// rejected (see `run`'s exit-code classification). A skewed system clock
-/// must not be able to turn this into a hard error.
+/// Warn (never fail) if the local, unverified read of the token's `exp` claim says it's already
+/// past or close to expiry. This is advisory only: the server's 401 is the sole authority for
+/// whether the token is actually rejected (see `main`'s exit-code classification). A skewed
+/// system clock must not be able to turn this into a hard error.
 fn warn_if_expiring(token: &str) {
     let Some(expiry) = auth::token_expiry(token) else {
         return;
@@ -161,12 +183,11 @@ async fn main() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    // _guard must live until it is explicitly dropped (below) to flush the
-    // file appender. It must NOT still be alive when `std::process::exit` is
-    // called: `exit` skips destructors entirely, so a guard dropped only by
-    // scope-exit-after-exit would never flush and `--log-file` would lose its
-    // tail. So: compute the exit code first, `drop(_guard)` explicitly, THEN
-    // call `exit`.
+    // _guard must live until it is explicitly dropped (below) to flush the file appender. It
+    // must NOT still be alive when `std::process::exit` is called: `exit` skips destructors
+    // entirely, so a guard dropped only by scope-exit-after-exit would never flush and
+    // `--log-file` would lose its tail. So: compute the exit code first, `drop(_guard)`
+    // explicitly, THEN call `exit`.
     let _guard = if let Some(ref log_path) = cli.log_file {
         let path = std::path::Path::new(log_path);
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -191,14 +212,13 @@ async fn main() {
             .init();
         None
     };
-    tracing_log::LogTracer::init().ok();
 
     let result = run(cli).await;
 
     let code: i32 = match result {
         Ok(()) => 0,
         Err(err) => {
-            if err.downcast_ref::<api::ApiError>().is_some() {
+            if let Some(ApiClientError::Unauthorized) = err.downcast_ref::<ApiClientError>() {
                 eprintln!("Token expired or rejected. Run `floppa-cli login` again.");
                 EXIT_AUTH
             } else {
@@ -214,11 +234,16 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let token_file = cli.token_file.as_deref();
+    let tokens = auth::TokenSource::new(cli.token, cli.token_file.clone());
+    let token_file_str = cli
+        .token_file
+        .as_deref()
+        .and_then(|p| p.to_str())
+        .map(str::to_string);
 
     match cli.command {
         Command::Login { api_url } => {
-            auth::login(&api_url, token_file).await?;
+            auth::login(&api_url, &tokens).await?;
         }
         Command::Connect {
             config,
@@ -231,8 +256,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Some(path) => std::fs::read_to_string(&path)
                     .with_context(|| format!("Failed to read config file: {path}"))?,
                 None => {
-                    let token = auth::load_token(token_file)?
-                        .context("Not logged in. Run `floppa-cli login` first.")?;
+                    let token = tokens.require()?;
                     warn_if_expiring(&token);
                     let client = api::ApiClient::new(&api_url, &token);
                     let me = client.get_me().await?;
@@ -247,11 +271,9 @@ async fn run(cli: Cli) -> Result<()> {
                     } else {
                         bail!("No active subscription");
                     }
-                    if protocol == "vless" {
-                        client.get_vless_config().await?
-                    } else {
-                        client.find_or_create_peer(&protocol).await?
-                    }
+                    client
+                        .config_for(protocol, &auth::device_identity()?)
+                        .await?
                 }
             };
 
@@ -262,20 +284,23 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Peers { api_url } => {
-            let token = auth::load_token(token_file)?
-                .context("Not logged in. Run `floppa-cli login` first.")?;
+            let token = tokens.require()?;
             let client = api::ApiClient::new(&api_url, &token);
             let peers = client.list_peers().await?;
             if peers.is_empty() {
                 eprintln!("No peers found.");
             } else {
-                println!("{:<6} {:<18} {:<14} Device", "ID", "IP", "Status");
+                println!(
+                    "{:<6} {:<18} {:<14} {:<10} Device",
+                    "ID", "IP", "Status", "Protocol"
+                );
                 for p in &peers {
                     println!(
-                        "{:<6} {:<18} {:<14} {}",
+                        "{:<6} {:<18} {:<14} {:<10} {}",
                         p.id,
                         p.assigned_ip,
                         p.sync_status,
+                        p.protocol,
                         p.device_name.as_deref().unwrap_or("-")
                     );
                 }
@@ -286,21 +311,47 @@ async fn run(cli: Cli) -> Result<()> {
             peer_id,
             api_url,
         } => {
-            let token = auth::load_token(token_file)?
-                .context("Not logged in. Run `floppa-cli login` first.")?;
+            let token = tokens.require()?;
             let client = api::ApiClient::new(&api_url, &token);
-            let config = if protocol == "vless" {
-                client.get_vless_config().await?
-            } else {
-                match peer_id {
-                    Some(id) => client.get_peer_config(id).await?,
-                    None => client.find_or_create_peer(&protocol).await?,
+            let config = match (protocol, peer_id) {
+                (api::Protocol::WireGuard | api::Protocol::AmneziaWg, Some(id)) => {
+                    client.get_peer_config(id).await?
+                }
+                (api::Protocol::Vless, Some(_)) => bail!("--peer-id does not apply to VLESS"),
+                (protocol, None) => {
+                    client
+                        .config_for(protocol, &auth::device_identity()?)
+                        .await?
                 }
             };
             print!("{config}");
         }
-        Command::Logout => {
-            auth::logout(token_file)?;
+        Command::Logout { api_url } => {
+            // Best effort on the server side: a token the server no longer accepts (expired,
+            // already signed out elsewhere) is exactly the one that must still go locally.
+            if let Some(token) = tokens.load()? {
+                match auth::session_id(&token) {
+                    Some(session_id) => {
+                        match api::ApiClient::new(&api_url, &token)
+                            .delete_session(session_id)
+                            .await
+                        {
+                            Ok(()) => eprintln!("Session ended on the server."),
+                            Err(
+                                api::ApiClientError::Unauthorized
+                                | api::ApiClientError::NotFound(_),
+                            ) => {
+                                eprintln!("The server had already ended this session.")
+                            }
+                            Err(e) => eprintln!("Could not end the session on the server: {e}"),
+                        }
+                    }
+                    None => {
+                        eprintln!("Token has no session to end on the server; removing it locally.")
+                    }
+                }
+            }
+            tokens.remove()?;
             eprintln!("Logged out.");
         }
         Command::Service { action } => match action {
@@ -314,11 +365,11 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 service::install(
                     config.as_deref(),
-                    &protocol,
+                    protocol.as_str(),
                     &interface,
                     no_dns,
                     log_file.as_deref(),
-                    token_file,
+                    token_file_str.as_deref(),
                     !no_start,
                 )?;
             }
@@ -334,93 +385,161 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 service::print_unit(
                     config.as_deref(),
-                    &protocol,
+                    protocol.as_str(),
                     &interface,
                     no_dns,
                     log_file.as_deref(),
-                    token_file,
+                    token_file_str.as_deref(),
                 )?;
             }
         },
+        Command::Stop {
+            interface,
+            pid,
+            force,
+        } => {
+            stop::stop(&interface, pid, force)?;
+        }
     }
 
     Ok(())
+}
+
+/// The running tunnel, whichever protocol backs it.
+enum Tunnel {
+    WireGuard(tunnel::FloppaDevice),
+    Vless(shoes_lite::api::VlessTunnel),
+}
+
+impl Tunnel {
+    async fn stop(self) -> Result<()> {
+        match self {
+            Tunnel::WireGuard(device) => {
+                device.stop().await;
+                Ok(())
+            }
+            Tunnel::Vless(tunnel) => tunnel
+                .stop()
+                .await
+                .map_err(|e| anyhow::anyhow!("VLESS tunnel stop failed: {e}")),
+        }
+    }
+}
+
+/// Tear down a previous (rollback, tunnel) generation, explicitly and completely, before a
+/// rebuild constructs the next one.
+///
+/// Ordering is load-bearing: `Rollback::run` disarms the guard (`take()`s both its fields), so
+/// once this returns, dropping the (now-empty) `Rollback` is a harmless no-op — see
+/// rollback.rs. If instead the new tunnel were built first and this teardown ran second, it
+/// would silently rip out the routes/DNS the new tunnel had just applied. This is exactly the
+/// hazard `reconnect`'s rebuild loop creates: it calls the closure repeatedly for the lifetime
+/// of the process, so a stale guard firing at the wrong moment is a real, if intermittent,
+/// failure mode — not a hypothetical one.
+async fn teardown_previous(mut rollback: rollback::Rollback, tunnel: Tunnel) {
+    if let Err(e) = rollback.run() {
+        eprintln!("Rollback of previous tunnel incomplete: {e:#}");
+    }
+    if let Err(e) = tunnel.stop().await {
+        eprintln!("Failed to stop previous tunnel: {e:#}");
+    }
 }
 
 async fn connect_wireguard(config_str: &str, interface: &str, no_dns: bool) -> Result<()> {
     let interface = interface.to_string();
     let config_str = config_str.to_string();
 
-    // Shared, rebuildable tunnel state. `Device` is not `Clone` and is torn
-    // down via `stop(self)`, so it lives inside a RefCell we swap on rebuild.
-    let device: std::rc::Rc<std::cell::RefCell<Option<tunnel::FloppaDevice>>> =
+    // Shared, rebuildable tunnel state: the live tunnel plus the rollback guard that undoes its
+    // host-side changes (routes, DNS). Neither is `Clone`, so both live inside a `RefCell` the
+    // rebuild closure swaps on every (re)connect.
+    let state: std::rc::Rc<std::cell::RefCell<Option<(rollback::Rollback, Tunnel)>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
 
     let rebuild = {
-        let device = device.clone();
+        let state = state.clone();
         let config_str = config_str.clone();
         let interface = interface.clone();
         move || -> reconnect::BoxFutureLocal<Result<()>> {
-            let device = device.clone();
+            let state = state.clone();
             let config_str = config_str.clone();
             let interface = interface.clone();
             Box::pin(async move {
-                // Tear down any previous instance before rebuilding.
-                let prev = device.borrow_mut().take();
-                if let Some(d) = prev {
-                    d.stop().await;
-                }
-                if !no_dns {
-                    let _ = dns::restore_dns();
+                // Tear down any previous generation BEFORE building the new one.
+                let previous = state.borrow_mut().take();
+                if let Some((old_rollback, old_tunnel)) = previous {
+                    teardown_previous(old_rollback, old_tunnel).await;
                 }
 
-                let wg_config = tunnel::WgConfig::from_config_str(&config_str)?;
-                eprintln!("Creating WireGuard tunnel on {interface}...");
-                let dev = tunnel::create_tunnel(&wg_config, &interface).await?;
+                let config =
+                    TunnelConfig::parse(&config_str).context("Invalid WireGuard config")?;
+                let endpoint = tunnel::resolve_endpoint(&config).await?;
+                let name = if config.is_amneziawg() {
+                    "AmneziaWG"
+                } else {
+                    "WireGuard"
+                };
+                eprintln!("Creating {name} tunnel on {interface}...");
+                let device = tunnel::create_tunnel(&config, endpoint, &interface).await?;
                 eprintln!("Configuring networking...");
-                tunnel::configure_networking(&wg_config, &interface).await?;
-                if !no_dns {
-                    dns::set_dns(&wg_config)?;
+                let addr = tunnel::bring_up_interface(&config, &interface)?;
+                let mut rollback = rollback::Rollback::new(net::configure_routes(
+                    endpoint.ip(),
+                    &config.peer.allowed_ips,
+                    &interface,
+                )?);
+                eprintln!("VPN IP: {}", addr.ip());
+                eprintln!("Endpoint: {} ({endpoint})", config.peer.endpoint);
+
+                let dns_servers: Vec<String> = config
+                    .dns_servers()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                if !no_dns && !dns_servers.is_empty() {
+                    rollback.set_dns(dns::apply(&interface, &dns_servers)?);
                 }
-                *device.borrow_mut() = Some(dev);
+
+                *state.borrow_mut() = Some((rollback, Tunnel::WireGuard(device)));
                 Ok(())
             })
         }
     };
 
     let health = {
-        let device = device.clone();
+        let state = state.clone();
         let stale_after = reconnect::ReconnectConfig::default().handshake_stale_after;
         move || -> reconnect::BoxFutureLocal<Result<bool>> {
-            let device = device.clone();
+            let state = state.clone();
             Box::pin(async move {
-                // Take the device out of the shared cell for the duration of the
-                // read so we don't hold a RefCell borrow across an await point.
-                let held = device.borrow_mut().take();
-                let Some(d) = held else {
-                    *device.borrow_mut() = None;
+                // Take the state out of the shared cell for the duration of the read so we
+                // don't hold a RefCell borrow across an await point.
+                let held = state.borrow_mut().take();
+                let Some((rollback, tunnel)) = held else {
                     return Ok(false);
                 };
-                // Find the newest handshake across peers; if it is older than the
-                // stale threshold (or missing), the tunnel is considered down.
-                let result = d
-                    .read(async |dr| {
-                        dr.peers()
-                            .await
-                            .iter()
-                            .filter_map(|p| p.stats.last_handshake)
-                            .max()
-                            .map(|hs| {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default();
-                                now.saturating_sub(hs) <= stale_after
+                let healthy = match &tunnel {
+                    Tunnel::WireGuard(device) => {
+                        device
+                            .read(async |dr| {
+                                dr.peers()
+                                    .await
+                                    .iter()
+                                    .filter_map(|p| p.stats.last_handshake)
+                                    .max()
+                                    .map(|hs| {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default();
+                                        now.saturating_sub(hs) <= stale_after
+                                    })
+                                    .unwrap_or(false)
                             })
-                            .unwrap_or(false)
-                    })
-                    .await;
-                *device.borrow_mut() = Some(d);
-                Ok(result)
+                            .await
+                    }
+                    Tunnel::Vless(_) => unreachable!("connect_wireguard only builds WireGuard tunnels"),
+                };
+                *state.borrow_mut() = Some((rollback, tunnel));
+                Ok(healthy)
             })
         }
     };
@@ -428,8 +547,8 @@ async fn connect_wireguard(config_str: &str, interface: &str, no_dns: bool) -> R
     let signal = reconnect::ReconnectSignal::default();
     let _watcher = reconnect::spawn_resume_watcher(signal.clone());
 
-    // The reconnect loop owns the lifecycle from here; it drives rebuild/health
-    // until a shutdown signal arrives. We reuse Ctrl+C / SIGTERM as the abort.
+    // The reconnect loop owns the lifecycle from here; it drives rebuild/health until a
+    // shutdown signal arrives. We reuse Ctrl+C as the abort.
     let shutdown = Box::pin(async move {
         let _ = tokio::signal::ctrl_c().await;
     });
@@ -443,13 +562,11 @@ async fn connect_wireguard(config_str: &str, interface: &str, no_dns: bool) -> R
     .await;
 
     eprintln!("\nDisconnecting...");
-    if !no_dns {
-        let _ = dns::restore_dns();
-    }
-    // Extract the device from the shared cell before awaiting stop().
-    let dev = device.borrow_mut().take();
-    if let Some(d) = dev {
-        d.stop().await;
+    // Final teardown happens once, here, after the reconnect loop has returned — not inside the
+    // rebuild closure, and not via a `Drop` firing on some other generation's guard.
+    let final_state = state.borrow_mut().take();
+    if let Some((rollback, tunnel)) = final_state {
+        teardown_previous(rollback, tunnel).await;
     }
     result?;
     eprintln!("Disconnected.");
@@ -460,42 +577,48 @@ async fn connect_vless(config_str: &str, interface: &str, no_dns: bool) -> Resul
     let interface = interface.to_string();
     let config_str = config_str.trim().to_string();
 
-    let tunnel: std::rc::Rc<std::cell::RefCell<Option<shoes_lite::api::VlessTunnel>>> =
+    let state: std::rc::Rc<std::cell::RefCell<Option<(rollback::Rollback, Tunnel)>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
 
     let rebuild = {
-        let tunnel = tunnel.clone();
+        let state = state.clone();
         let config_str = config_str.clone();
         let interface = interface.clone();
         move || -> reconnect::BoxFutureLocal<Result<()>> {
-            let tunnel = tunnel.clone();
+            let state = state.clone();
             let config_str = config_str.clone();
             let interface = interface.clone();
             Box::pin(async move {
-                // Tear down any previous instance before rebuilding.
-                let prev = tunnel.borrow_mut().take();
-                if let Some(t) = prev {
-                    let _ = t.stop().await;
-                }
-                if !no_dns {
-                    let _ = dns::restore_dns();
+                let previous = state.borrow_mut().take();
+                if let Some((old_rollback, old_tunnel)) = previous {
+                    teardown_previous(old_rollback, old_tunnel).await;
                 }
 
                 let config = vless::parse_uri(config_str.as_str())?;
                 eprintln!("Creating VLESS+REALITY tunnel on {interface}...");
                 eprintln!("Server: {}", config.server_addr);
                 eprintln!("SNI: {}", config.server_name);
-                let t = vless::create_tunnel(&config, &interface).await?;
+                let tunnel = vless::create_tunnel(&config, &interface).await?;
+
                 eprintln!("Configuring networking...");
-                vless::configure_networking(&config, &interface).await?;
+                let endpoint = vless::endpoint_ip(&config).await?;
+                let mut rollback = rollback::Rollback::new(net::configure_routes(
+                    endpoint,
+                    &vless::allowed_ips_networks(&config)?,
+                    &interface,
+                )?);
+                eprintln!("VPN IP: {}", config.address.as_deref().unwrap_or("unknown"));
+                eprintln!("Endpoint: {}", config.server_addr);
+
                 if !no_dns && let Some(ref dns) = config.dns {
                     let servers: Vec<String> =
                         dns.split(',').map(|s| s.trim().to_string()).collect();
                     if !servers.is_empty() {
-                        dns::write_dns(&servers)?;
+                        rollback.set_dns(dns::apply(&interface, &servers)?);
                     }
                 }
-                *tunnel.borrow_mut() = Some(t);
+
+                *state.borrow_mut() = Some((rollback, Tunnel::Vless(tunnel)));
                 Ok(())
             })
         }
@@ -538,12 +661,9 @@ async fn connect_vless(config_str: &str, interface: &str, no_dns: bool) -> Resul
     .await;
 
     eprintln!("\nDisconnecting...");
-    if !no_dns {
-        let _ = dns::restore_dns();
-    }
-    let tunnel_dev = tunnel.borrow_mut().take();
-    if let Some(t) = tunnel_dev {
-        let _ = t.stop().await;
+    let final_state = state.borrow_mut().take();
+    if let Some((rollback, tunnel)) = final_state {
+        teardown_previous(rollback, tunnel).await;
     }
     result?;
     eprintln!("Disconnected.");

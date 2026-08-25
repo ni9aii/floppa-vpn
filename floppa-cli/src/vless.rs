@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
+use floppa_tunnel_config::conf::{Endpoint, comma_list};
+use floppa_tunnel_config::{route, vless};
 use ipnetwork::IpNetwork;
 use shoes_lite::api::{VlessConfig, VlessTunnel};
-use std::process::Command;
+use std::net::IpAddr;
 
 /// Parse a VLESS URI and create a VlessConfig with VPN defaults.
 pub fn parse_uri(uri: &str) -> Result<VlessConfig> {
@@ -9,16 +11,16 @@ pub fn parse_uri(uri: &str) -> Result<VlessConfig> {
 
     // Set VPN defaults if not specified in URI
     if config.address.is_none() {
-        config.address = Some("10.0.0.2".to_string());
+        config.address = Some(vless::ADDRESS.to_string());
     }
     if config.dns.is_none() {
-        config.dns = Some("1.1.1.1".to_string());
+        config.dns = Some(vless::DNS.to_string());
     }
     if config.mtu.is_none() {
-        config.mtu = Some(1500);
+        config.mtu = Some(vless::MTU);
     }
     if config.allowed_ips.is_none() {
-        config.allowed_ips = Some("0.0.0.0/0, ::/0".to_string());
+        config.allowed_ips = Some(comma_list(route::CATCH_ALL));
     }
 
     Ok(config)
@@ -31,78 +33,33 @@ pub async fn create_tunnel(config: &VlessConfig, interface: &str) -> Result<Vles
         .map_err(|e| anyhow!("{e}"))
 }
 
-fn run_ip(args: &[&str]) -> Result<()> {
-    let output = Command::new("ip").args(args).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow!("ip {} failed: {}", args.join(" "), stderr.trim()))
-    }
-}
-
-fn get_default_gateway() -> Result<Option<String>> {
-    let output = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()?;
-    let route_output = String::from_utf8_lossy(&output.stdout);
-    Ok(route_output
-        .split_whitespace()
-        .skip_while(|&w| w != "via")
-        .nth(1)
-        .map(|s| s.to_string()))
-}
-
-/// Configure routes for the VLESS tunnel (endpoint bypass + allowed IPs).
-pub async fn configure_networking(config: &VlessConfig, interface: &str) -> Result<()> {
-    // Add host route for VLESS endpoint via default gateway to prevent routing loop
-    let endpoint_host = config
+/// Resolve the VLESS server address to the IP the endpoint route must pin.
+pub async fn endpoint_ip(config: &VlessConfig) -> Result<IpAddr> {
+    let endpoint: Endpoint = config
         .server_addr
-        .split(':')
-        .next()
-        .unwrap_or(&config.server_addr);
-    let endpoint_ip: std::net::IpAddr = match endpoint_host.parse() {
-        Ok(ip) => ip,
-        Err(_) => {
-            // Resolve hostname
-            tokio::net::lookup_host(&config.server_addr)
-                .await?
-                .next()
-                .ok_or_else(|| anyhow!("Cannot resolve {}", config.server_addr))?
-                .ip()
-        }
+        .parse()
+        .map_err(|e| anyhow!("Invalid server address '{}': {e}", config.server_addr))?;
+    if let Some(ip) = endpoint.ip() {
+        return Ok(ip);
+    }
+    let addrs = tokio::net::lookup_host(endpoint.to_string())
+        .await
+        .map_err(|e| anyhow!("Failed to resolve {endpoint}: {e}"))?;
+    Ok(route::pick_endpoint(addrs)
+        .ok_or_else(|| anyhow!("{endpoint} resolved to no addresses"))?
+        .ip())
+}
+
+pub fn allowed_ips_networks(config: &VlessConfig) -> Result<Vec<IpNetwork>> {
+    let Some(allowed_ips) = config.allowed_ips.as_deref() else {
+        return Ok(route::CATCH_ALL.to_vec());
     };
-
-    if let Some(gateway) = get_default_gateway()? {
-        let endpoint_route = format!("{endpoint_ip}/32");
-        run_ip(&["route", "replace", &endpoint_route, "via", &gateway])?;
-        eprintln!("Endpoint route: {endpoint_route} via {gateway}");
-    }
-
-    // Parse allowed IPs and add routes through TUN
-    let allowed_ips_str = config.allowed_ips.as_deref().unwrap_or("0.0.0.0/0, ::/0");
-    let networks: Vec<IpNetwork> = allowed_ips_str
+    allowed_ips
         .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-
-    for network in &networks {
-        if network.prefix() == 0 {
-            if network.is_ipv4() {
-                run_ip(&["route", "replace", "0.0.0.0/1", "dev", interface])?;
-                run_ip(&["route", "replace", "128.0.0.0/1", "dev", interface])?;
-            } else {
-                let _ = run_ip(&["route", "replace", "::/1", "dev", interface]);
-                let _ = run_ip(&["route", "replace", "8000::/1", "dev", interface]);
-            }
-        } else {
-            run_ip(&["route", "replace", &network.to_string(), "dev", interface])?;
-        }
-    }
-
-    let addr = config.address.as_deref().unwrap_or("unknown");
-    eprintln!("VPN IP: {addr}");
-    eprintln!("Endpoint: {}", config.server_addr);
-
-    Ok(())
+        .map(|s| {
+            let s = s.trim();
+            s.parse()
+                .map_err(|_| anyhow!("Invalid allowed IPs entry '{s}'"))
+        })
+        .collect()
 }

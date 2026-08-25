@@ -9,23 +9,28 @@ name = "floppa-cli"
 path = "src/main.rs"
 
 [dependencies]
-gotatun = { git = "https://github.com/okhsunrog/gotatun", rev = "7005e0c", features = ["device", "tun"] }
+gotatun = { git = "https://github.com/okhsunrog/gotatun", tag = "amnezia-2026-08-25", features = ["device", "tun"] }
+floppa-tunnel-config = { git = "https://github.com/okhsunrog/floppa-vpn", rev = "723b31cb39c2bf64b481802e405a15213169ca4b", features = ["gotatun"] }
 tun = { version = "0.8", features = ["async"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64.workspace = true
 ipnetwork = "0.21"
 anyhow = "1"
 dirs = "6"
 open = "5"
-shoes-lite = { git = "https://github.com/okhsunrog/shoes-lite", rev = "d2fdeb2" }
+shoes-lite = { git = "https://github.com/okhsunrog/shoes-lite", tag = "v0.1.0" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracing-log = "0.2.0"
 tracing-appender = "0.2.4"
+thiserror = "2"
+uuid = { version = "1.25.0", features = ["v4"] }
+url = "2.5.8"
+# `stop`'s signal delivery to the connect process/process-group (SIGTERM/SIGKILL via raw kill(2)).
+libc = "0.2"
 # D-Bus (systemd-logind) for instant reconnect on system resume from sleep.
 zbus = "5"
 # Stream trait for the logind signal stream (zbus re-exports but doesn't expose

@@ -1,116 +1,249 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use url::Url;
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, ApiClientError};
+
+/// The uid/gid of the user behind `sudo`, so files created in their home stay theirs.
+struct SudoUser {
+    home: PathBuf,
+    uid: u32,
+    gid: u32,
+}
+
+/// `connect` needs root, so the CLI usually runs under sudo, where HOME and the config dir point
+/// at root's. The token was saved by the invoking user: look there instead.
+fn sudo_user() -> Option<SudoUser> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    let uid: u32 = std::env::var("SUDO_UID").ok()?.parse().ok()?;
+    let gid: u32 = std::env::var("SUDO_GID").ok()?.parse().ok()?;
+    if uid == 0 {
+        return None;
+    }
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    let home = passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == user).then(|| fields.nth(4).map(PathBuf::from))?
+    })?;
+    Some(SudoUser { home, uid, gid })
+}
 
 fn config_dir() -> Result<PathBuf> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| anyhow!("Cannot determine config directory"))?
-        .join("floppa-cli");
-    fs::create_dir_all(&dir)?;
+    let sudo = sudo_user();
+    let base = match &sudo {
+        Some(sudo) => sudo.home.join(".config"),
+        None => dirs::config_dir().ok_or_else(|| anyhow!("Cannot determine config directory"))?,
+    };
+    let dir = base.join("floppa-cli");
+    if !dir.is_dir() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+        give_to_sudo_user(&dir, sudo.as_ref());
+    }
     Ok(dir)
 }
 
-/// Resolve the token file path. `override_path` (the `--token-file` /
-/// `FLOPPA_TOKEN_FILE` value) wins when set — this is what lets a unit
-/// running as `User=root` read a token that was saved by a normal user.
-fn token_path(override_path: Option<&str>) -> Result<PathBuf> {
-    if let Some(path) = override_path {
-        return Ok(PathBuf::from(path));
+/// Files created as root in the invoking user's home are handed back to that user, so a later
+/// unprivileged `login` can replace them.
+fn give_to_sudo_user(path: &Path, sudo: Option<&SudoUser>) {
+    if let Some(sudo) = sudo
+        && let Err(e) = std::os::unix::fs::chown(path, Some(sudo.uid), Some(sudo.gid))
+    {
+        eprintln!("Could not chown {} to the sudo user: {e}", path.display());
     }
+}
+
+/// Write `content` to `path` with mode 0600 from the first byte: a temp file in the same
+/// directory, then an atomic rename over the destination.
+fn write_private(path: &Path, content: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    let _ = fs::remove_file(&tmp);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("Failed to create {}", tmp.display()))?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    give_to_sudo_user(&tmp, sudo_user().as_ref());
+    fs::rename(&tmp, path).with_context(|| format!("Failed to write {}", path.display()))
+}
+
+fn token_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("token"))
 }
 
-pub fn load_token(override_path: Option<&str>) -> Result<Option<String>> {
-    let path = token_path(override_path)?;
-    if path.exists() {
-        let token = fs::read_to_string(&path)
-            .context("Failed to read token file")?
-            .trim()
-            .to_string();
-        if token.is_empty() {
+/// Where the login token comes from: `FLOPPA_TOKEN` inline, or a file (`--token-file` /
+/// `FLOPPA_TOKEN_FILE`, default `<config dir>/floppa-cli/token`).
+pub struct TokenSource {
+    inline: Option<String>,
+    file: Option<PathBuf>,
+}
+
+impl TokenSource {
+    pub fn new(inline: Option<String>, file: Option<PathBuf>) -> Self {
+        Self { inline, file }
+    }
+
+    fn path(&self) -> Result<PathBuf> {
+        match &self.file {
+            Some(path) => Ok(path.clone()),
+            None => token_path(),
+        }
+    }
+
+    pub fn load(&self) -> Result<Option<String>> {
+        if let Some(token) = self.inline.as_deref().map(str::trim)
+            && !token.is_empty()
+        {
+            return Ok(Some(token.to_string()));
+        }
+        let path = self.path()?;
+        if !path.exists() {
             return Ok(None);
         }
-        Ok(Some(token))
-    } else {
-        Ok(None)
+        let token = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read token file {}", path.display()))?
+            .trim()
+            .to_string();
+        Ok((!token.is_empty()).then_some(token))
+    }
+
+    /// The token, or the error the user needs to see.
+    pub fn require(&self) -> Result<String> {
+        self.load()?
+            .context("Not logged in. Run `floppa-cli login` first.")
+    }
+
+    fn save(&self, token: &str) -> Result<()> {
+        let path = self.path()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty() && !p.is_dir())
+        {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        write_private(&path, token)
+    }
+
+    pub fn remove(&self) -> Result<()> {
+        let path = self.path()?;
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        Ok(())
     }
 }
 
-fn save_token(token: &str, override_path: Option<&str>) -> Result<()> {
-    let path = token_path(override_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).ok();
-    }
-    fs::write(&path, token).context("Failed to save token")?;
-    // Restrict permissions. This applies to the --token-file override path
-    // too: a root-readable token in the user's home is the same secret.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+/// The session (`jti`) a login token belongs to, read from its payload without verifying the
+/// signature — the CLI only needs the id to ask the server to end that session; the server
+/// verifies the token itself. `None` for a malformed token or one issued before sessions.
+pub fn session_id(token: &str) -> Option<uuid::Uuid> {
+    let payload = token.split('.').nth(1)?;
+    let json = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    claims.get("jti")?.as_str()?.parse().ok()
 }
 
-pub fn logout(override_path: Option<&str>) -> Result<()> {
-    let path = token_path(override_path)?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    Ok(())
+/// The token's `exp` claim, read from its payload without verifying the signature. Advisory
+/// only — see `main::warn_if_expiring`, the sole caller: this must never turn into a hard error,
+/// so a malformed/opaque token or an out-of-range `exp` (garbage or hostile token) falls through
+/// to `None` rather than panicking. `checked_add`, not `+`, is what makes the overflow case safe.
+pub fn token_expiry(token: &str) -> Option<std::time::SystemTime> {
+    let payload = token.split('.').nth(1)?;
+    let json = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    let exp = claims.get("exp")?.as_u64()?;
+    std::time::SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(exp))
 }
 
-/// Decode the `exp` claim from a JWT without verifying the signature. This is
-/// advisory only — used to warn the user before expiry — never to reject a
-/// token. Returns `None` for anything that isn't a parsable JWT with a
-/// numeric `exp`; callers must treat that as "unknown", not "expired".
-pub fn token_expiry(token: &str) -> Option<SystemTime> {
-    use base64::Engine;
+/// What the server tracks a peer by: a stable per-installation UUID plus a display name.
+pub struct DeviceIdentity {
+    pub id: String,
+    pub name: String,
+}
 
-    let payload_b64 = token.split('.').nth(1)?;
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-    let exp = payload.get("exp")?.as_u64()?;
-    // `checked_add`, not `+`: an out-of-range `exp` (garbage or hostile token)
-    // must fall through to `None` like any other unparsable claim, not panic
-    // via `SystemTime`'s `Add` overflow. This function must never turn into a
-    // hard error — see its doc comment.
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(exp))
+/// The device identity of this CLI installation. The id is generated once and persisted in the
+/// config dir, so every run finds its own peer instead of adopting another device's.
+pub fn device_identity() -> Result<DeviceIdentity> {
+    let path = config_dir()?.join("device_id");
+    let id = match fs::read_to_string(&path) {
+        Ok(existing) if uuid::Uuid::parse_str(existing.trim()).is_ok() => {
+            existing.trim().to_string()
+        }
+        _ => {
+            let id = uuid::Uuid::new_v4().to_string();
+            write_private(&path, &format!("{id}\n"))
+                .with_context(|| format!("Failed to save device id to {}", path.display()))?;
+            id
+        }
+    };
+    Ok(DeviceIdentity {
+        id,
+        name: hostname(),
+    })
+}
+
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+        .unwrap_or_else(|_| "floppa-cli".to_string())
 }
 
 /// Run the login flow: start local server, open browser, capture code, exchange for JWT.
-pub async fn login(api_url: &str, token_file: Option<&str>) -> Result<()> {
+pub async fn login(api_url: &str, tokens: &TokenSource) -> Result<()> {
     // Bind to a random port on 127.0.0.1
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    // The nonce rides along in the redirect URI; the server appends `&code=` to it. A callback
+    // without the matching state is some other local process guessing our port.
+    let state = uuid::Uuid::new_v4().simple().to_string();
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback?state={state}");
 
-    let auth_url = format!(
-        "{}/auth/telegram/start?redirect_uri={}",
-        api_url.trim_end_matches('/'),
-        urlencoding(&redirect_uri)
-    );
+    let auth_url = Url::parse_with_params(
+        &format!("{}/auth/telegram/start", api_url.trim_end_matches('/')),
+        [("redirect_uri", redirect_uri.as_str())],
+    )
+    .context("Invalid API URL")?;
 
     eprintln!("Opening browser for Telegram login...");
     eprintln!("If it doesn't open, visit: {auth_url}");
 
-    if open::that(&auth_url).is_err() {
+    if open::that(auth_url.as_str()).is_err() {
         eprintln!("Failed to open browser automatically.");
     }
 
-    // Wait for the callback
-    let code = wait_for_callback(listener).await?;
+    let code = tokio::time::timeout(LOGIN_TIMEOUT, wait_for_callback(listener, &state))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "Login timed out after {} minutes",
+                LOGIN_TIMEOUT.as_secs() / 60
+            )
+        })??;
 
     // Exchange code for JWT
-    let auth = ApiClient::exchange_code(api_url, &code).await?;
-    save_token(&auth.token, token_file)?;
+    let auth = match ApiClient::exchange_code(api_url, &code).await {
+        Err(ApiClientError::Unauthorized) => bail!("Login code expired or invalid. Try again."),
+        other => other?,
+    };
+    tokens.save(&auth.token)?;
 
     let name = auth
         .user
@@ -121,123 +254,124 @@ pub async fn login(api_url: &str, token_file: Option<&str>) -> Result<()> {
 
     eprintln!("Logged in as {name} (id: {})", auth.user.id);
 
-    match token_expiry(&auth.token) {
-        Some(exp) => eprintln!("Token valid until {}", format_time(exp)),
-        None => eprintln!("Could not determine token expiry (unexpected token format)."),
-    }
-
     Ok(())
 }
 
-/// Render a `SystemTime` as a UTC `YYYY-MM-DD HH:MM:SS UTC` timestamp without
-/// pulling in a date/time crate — good enough for a human-facing log line.
-fn format_time(t: SystemTime) -> String {
-    let secs = match t.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(e) => -(e.duration().as_secs() as i64),
-    };
-    let days = secs.div_euclid(86_400);
-    let time_of_day = secs.rem_euclid(86_400);
-    let (hour, minute, second) = (time_of_day / 3600, (time_of_day / 60) % 60, time_of_day % 60);
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Serve the loopback listener until a `GET /callback?state=<expected>&code=...` arrives; any
+/// other request (favicon, wrong path, wrong state) gets an error page and the wait continues.
+async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .context("Failed to accept callback connection")?;
+
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await?;
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+
+        let (status, message) = match parse_callback(path, expected_state) {
+            Ok(code) => {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "Login successful!",
+                    "You can close this tab and return to the terminal.",
+                )
+                .await?;
+                return Ok(code);
+            }
+            Err(CallbackError::NotCallback) => ("404 Not Found", "Not found"),
+            Err(CallbackError::BadState) => ("400 Bad Request", "Login state mismatch"),
+            Err(CallbackError::MissingCode) => ("400 Bad Request", "Missing login code"),
+        };
+        eprintln!("Ignoring request {path}: {message}");
+        respond(
+            &mut stream,
+            status,
+            message,
+            "Return to the terminal and try again.",
+        )
+        .await?;
+    }
 }
 
-/// Days-since-epoch to (year, month, day), UTC civil calendar. Standard
-/// algorithm (Howard Hinnant's `civil_from_days`); avoids a date/time crate
-/// dependency for what is otherwise a one-line format.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m, d)
+enum CallbackError {
+    NotCallback,
+    BadState,
+    MissingCode,
 }
 
-/// Wait for a single HTTP GET request on the callback listener, extract `code` param.
-async fn wait_for_callback(listener: TcpListener) -> Result<String> {
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .context("Failed to accept callback connection")?;
+/// Extract the login code from a request path, requiring the state nonce to match.
+fn parse_callback(path: &str, expected_state: &str) -> Result<String, CallbackError> {
+    let url = Url::parse("http://127.0.0.1")
+        .and_then(|base| base.join(path))
+        .map_err(|_| CallbackError::NotCallback)?;
+    if url.path() != "/callback" {
+        return Err(CallbackError::NotCallback);
+    }
+    let mut code = None;
+    let mut state = None;
+    for (key, value) in url.query_pairs() {
+        match &*key {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if state.as_deref() != Some(expected_state) {
+        return Err(CallbackError::BadState);
+    }
+    code.filter(|c| !c.is_empty())
+        .ok_or(CallbackError::MissingCode)
+}
 
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Parse GET /callback?code=XYZ HTTP/1.1
-    let code = request
-        .lines()
-        .next()
-        .and_then(|line| {
-            let path = line.split_whitespace().nth(1)?;
-            let query = path.split('?').nth(1)?;
-            query.split('&').find_map(|param| {
-                let (k, v) = param.split_once('=')?;
-                if k == "code" {
-                    Some(v.to_string())
-                } else {
-                    None
-                }
-            })
-        })
-        .ok_or_else(|| anyhow!("No 'code' parameter in callback"))?;
-
-    // Respond with success page
-    let body = r#"<!DOCTYPE html>
+async fn respond(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    title: &str,
+    detail: &str,
+) -> Result<()> {
+    let body = format!(
+        r#"<!DOCTYPE html>
 <html><head><title>Floppa VPN</title></head>
 <body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
 <div style="text-align:center">
-<h1>Login successful!</h1>
-<p>You can close this tab and return to the terminal.</p>
-</div></body></html>"#;
-
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
+<h1>{title}</h1>
+<p>{detail}</p>
+</div></body></html>"#
     );
-
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
-
-    Ok(code)
-}
-
-fn urlencoding(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u8),
-        })
-        .collect()
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
-
-    /// Build a minimal unsigned JWT with the given payload JSON — good enough
-    /// for testing the (unverified) decode path.
-    fn fake_jwt(payload_json: &str) -> String {
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
-        format!("{header}.{payload}.sig")
-    }
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn token_expiry_reads_known_exp() {
-        let token = fake_jwt(r#"{"sub":"1","exp":1735689600}"#);
-        let expiry = token_expiry(&token).expect("should decode exp");
+        let jwt = format!(
+            "eyJhbGciOiJIUzI1NiJ9.{}.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"sub":"1","exp":1735689600}"#.as_bytes())
+        );
+        let expiry = token_expiry(&jwt).expect("should decode exp");
         assert_eq!(
             expiry,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_735_689_600)
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_735_689_600)
         );
     }
 
@@ -252,9 +386,64 @@ mod tests {
     }
 
     #[test]
-    fn format_time_renders_known_date() {
-        // 1735689600 = 2025-01-01T00:00:00Z
-        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_735_689_600);
-        assert_eq!(format_time(t), "2025-01-01 00:00:00 UTC");
+    fn session_id_comes_from_the_unverified_payload() {
+        let jwt = |claims: &str| {
+            format!(
+                "eyJhbGciOiJIUzI1NiJ9.{}.sig",
+                URL_SAFE_NO_PAD.encode(claims.as_bytes())
+            )
+        };
+        let id = "0f3a1c2e-9b7d-4e6a-8c1f-2d3e4f5a6b7c";
+        assert_eq!(
+            session_id(&jwt(&format!(r#"{{"sub":1,"jti":"{id}"}}"#))),
+            Some(id.parse().unwrap())
+        );
+        // Legacy token (no jti), a non-UUID jti, and garbage.
+        assert_eq!(session_id(&jwt(r#"{"sub":1}"#)), None);
+        assert_eq!(session_id(&jwt(r#"{"jti":"nope"}"#)), None);
+        assert_eq!(session_id("not.a.jwt"), None);
+        assert_eq!(session_id(""), None);
+    }
+
+    #[test]
+    fn callback_requires_path_state_and_code() {
+        let ok = parse_callback("/callback?state=abc&code=x%2Fy", "abc");
+        assert_eq!(ok.ok().as_deref(), Some("x/y"));
+        assert!(matches!(
+            parse_callback("/favicon.ico", "abc"),
+            Err(CallbackError::NotCallback)
+        ));
+        assert!(matches!(
+            parse_callback("/callback?state=other&code=x", "abc"),
+            Err(CallbackError::BadState)
+        ));
+        assert!(matches!(
+            parse_callback("/callback?code=x", "abc"),
+            Err(CallbackError::BadState)
+        ));
+        assert!(matches!(
+            parse_callback("/callback?state=abc", "abc"),
+            Err(CallbackError::MissingCode)
+        ));
+    }
+
+    #[test]
+    fn write_private_creates_0600_and_replaces_atomically() {
+        let dir = std::env::temp_dir().join(format!("floppa-cli-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+
+        write_private(&path, "first").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        write_private(&path, "second").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        assert!(!path.with_extension("tmp").exists());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
